@@ -47,18 +47,7 @@ where
     // Enforce a single active session at a time.
     let session_guard = match Arc::clone(&app.session_lock).try_lock_owned() {
         Ok(g) => g,
-        Err(_) => {
-            tracing::warn!("rejecting connection: server already has an active session");
-            let busy = AsrReply::Error {
-                message: "server is busy: another session is active".to_string(),
-                code: 503,
-            };
-            if let Ok(json) = serde_json::to_string(&busy) {
-                let _ = tx.send(Message::Text(json.into())).await;
-            }
-            let _ = tx.close().await;
-            return Ok(());
-        }
+        Err(_) => anyhow::bail!("rejecting connection: server already has an active session"),
     };
 
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AsrReply>();
@@ -301,10 +290,11 @@ fn run_asr_loop<Q: BackendQ>(
                     )?;
                 }
                 if unended_word {
-                    let _ =
-                        reply_tx.send(AsrReply::EndText { stop_s: total_duration_s, stream_id });
+                    let _ = reply_tx
+                        .send(AsrReply::EndText { stop_s: total_duration_s, stream_id })
+                        .is_ok();
                 }
-                let _ = reply_tx.send(AsrReply::EndOfStream);
+                let _ = reply_tx.send(AsrReply::EndOfStream).is_ok();
                 break;
             }
         }
@@ -342,7 +332,7 @@ fn step_one_frame<Q: BackendQ>(
         });
         for word in sr.words {
             match word {
-                AsrWord::Word { tokens, batch_idx, start_time } if batch_idx == 0 => {
+                AsrWord::Word { tokens, batch_idx: _, start_time } => {
                     text_tokens.push(3); // separator/space
                     text_tokens.extend_from_slice(&tokens);
                     let decoded = tokenizer.decode_piece_ids(text_tokens).unwrap_or_default();
@@ -357,12 +347,11 @@ fn step_one_frame<Q: BackendQ>(
                     }
                     *unended_word = true;
                 }
-                AsrWord::EndWord { stop_time, batch_idx } if batch_idx == 0 => {
+                AsrWord::EndWord { stop_time, batch_idx: _ } => {
                     *unended_word = false;
                     let _ =
                         reply_tx.send(AsrReply::EndText { stop_s: stop_time as f32, stream_id });
                 }
-                _ => {}
             }
         }
     }
