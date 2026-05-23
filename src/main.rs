@@ -19,6 +19,9 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:8080")]
     addr: String,
 
+    #[arg(long)]
+    model: Option<String>,
+
     #[arg(long, default_value_t = 0.0)]
     temperature: f64,
 
@@ -74,7 +77,8 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
         unsafe {
             dev.disable_event_tracking();
         }
-        let s = model::load_asr::<xn::Unquantized<half::bf16, _>>(args.temperature, dev)?;
+        let m = args.model.as_deref();
+        let s = model::load_asr::<xn::Unquantized<half::bf16, _>>(m, args.temperature, dev)?;
         Ok(model::AppState::Cuda(Arc::new(s)))
     } else {
         build_cpu_state(args)
@@ -92,50 +96,51 @@ fn build_app_state(args: &Args) -> Result<model::AppState> {
 fn build_cpu_state(args: &Args) -> Result<model::AppState> {
     use model::AppState;
     let temp = args.temperature;
+    let m = args.model.as_deref();
     let state = match args.quant.as_deref() {
         None => {
             tracing::info!("using cpu backend (unquantized f32)");
-            AppState::Cpu(Arc::new(model::load_asr::<xn::Unquantized<f32, _>>(temp, xn::CPU)?))
+            AppState::Cpu(Arc::new(model::load_asr::<xn::Unquantized<f32, _>>(m, temp, xn::CPU)?))
         }
         Some("q8" | "q8_0") => {
             tracing::info!("using cpu q8_0 backend");
-            AppState::Q80(Arc::new(model::load_asr::<xn::quantized::Q80F32>(temp, xn::CPU)?))
+            AppState::Q80(Arc::new(model::load_asr::<xn::quantized::Q80F32>(m, temp, xn::CPU)?))
         }
         Some("q8_1") => {
             tracing::info!("using cpu q8_1 backend");
-            AppState::Q81(Arc::new(model::load_asr::<xn::quantized::Q81F32>(temp, xn::CPU)?))
+            AppState::Q81(Arc::new(model::load_asr::<xn::quantized::Q81F32>(m, temp, xn::CPU)?))
         }
         Some("q8k") => {
             tracing::info!("using cpu q8k backend");
-            AppState::Q8k(Arc::new(model::load_asr::<xn::quantized::Q8kF32>(temp, xn::CPU)?))
+            AppState::Q8k(Arc::new(model::load_asr::<xn::quantized::Q8kF32>(m, temp, xn::CPU)?))
         }
         Some("q6k") => {
             tracing::info!("using cpu q6k backend");
-            AppState::Q6k(Arc::new(model::load_asr::<xn::quantized::Q6kF32>(temp, xn::CPU)?))
+            AppState::Q6k(Arc::new(model::load_asr::<xn::quantized::Q6kF32>(m, temp, xn::CPU)?))
         }
         Some("q5" | "q5_0") => {
             tracing::info!("using cpu q5_0 backend");
-            AppState::Q50(Arc::new(model::load_asr::<xn::quantized::Q50F32>(temp, xn::CPU)?))
+            AppState::Q50(Arc::new(model::load_asr::<xn::quantized::Q50F32>(m, temp, xn::CPU)?))
         }
         Some("q5_1") => {
             tracing::info!("using cpu q5_1 backend");
-            AppState::Q51(Arc::new(model::load_asr::<xn::quantized::Q51F32>(temp, xn::CPU)?))
+            AppState::Q51(Arc::new(model::load_asr::<xn::quantized::Q51F32>(m, temp, xn::CPU)?))
         }
         Some("q5k") => {
             tracing::info!("using cpu q5k backend");
-            AppState::Q5k(Arc::new(model::load_asr::<xn::quantized::Q5kF32>(temp, xn::CPU)?))
+            AppState::Q5k(Arc::new(model::load_asr::<xn::quantized::Q5kF32>(m, temp, xn::CPU)?))
         }
         Some("q4" | "q4_0") => {
             tracing::info!("using cpu q4_0 backend");
-            AppState::Q40(Arc::new(model::load_asr::<xn::quantized::Q40F32>(temp, xn::CPU)?))
+            AppState::Q40(Arc::new(model::load_asr::<xn::quantized::Q40F32>(m, temp, xn::CPU)?))
         }
         Some("q4_1") => {
             tracing::info!("using cpu q4_1 backend");
-            AppState::Q41(Arc::new(model::load_asr::<xn::quantized::Q41F32>(temp, xn::CPU)?))
+            AppState::Q41(Arc::new(model::load_asr::<xn::quantized::Q41F32>(m, temp, xn::CPU)?))
         }
         Some("q4k") => {
             tracing::info!("using cpu q4k backend");
-            AppState::Q4k(Arc::new(model::load_asr::<xn::quantized::Q4kF32>(temp, xn::CPU)?))
+            AppState::Q4k(Arc::new(model::load_asr::<xn::quantized::Q4kF32>(m, temp, xn::CPU)?))
         }
         Some(other) => anyhow::bail!("unsupported --quant value '{other}'"),
     };
