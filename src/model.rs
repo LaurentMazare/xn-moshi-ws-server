@@ -50,6 +50,7 @@ struct ModelPaths {
     lm: std::path::PathBuf,
     mimi: std::path::PathBuf,
     tokenizer: std::path::PathBuf,
+    config: Option<xn_moshi::moshi::Config>,
     model_name: String,
 }
 
@@ -68,7 +69,7 @@ impl ModelPaths {
         let mimi = repo.get(Self::MIMI_FILE).map_err(anyhow::Error::from)?;
         let tokenizer = repo.get(Self::TOKENIZER_FILE).map_err(anyhow::Error::from)?;
         tracing::info!(?lm, ?mimi, ?tokenizer, "model weights ready");
-        Ok(Self { lm, mimi, tokenizer, model_name: Self::REPO_ID.to_string() })
+        Ok(Self { lm, mimi, tokenizer, config: None, model_name: Self::REPO_ID.to_string() })
     }
 }
 
@@ -79,8 +80,22 @@ pub fn load_asr<Q: BackendQ>(
 ) -> Result<AppStateB<Q>> {
     let paths = match model_path {
         None => ModelPaths::stt_2b()?,
-        Some(_) => {
-            anyhow::bail!("custom model paths not supported yet, only stt-2.6b")
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            let parent = path.parent().context("model config path has no parent directory")?;
+            let config = std::fs::read_to_string(path)?;
+            let config: xn_moshi::moshi::Config = serde_json::from_str(&config)?;
+            ModelPaths {
+                lm: parent.join("model.safetensors"),
+                mimi: parent.join("mimi.safetensors"),
+                tokenizer: parent.join("tokenizer.model"),
+                config: Some(config),
+                model_name: path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("custom_model")
+                    .to_string(),
+            }
         }
     };
 
@@ -100,7 +115,7 @@ pub fn load_asr<Q: BackendQ>(
     })?;
 
     let lm_vb = VB::load(&[paths.lm], dev)?.root();
-    let lm_config = lm::Config::stt_2_6b();
+    let lm_config = paths.config.map_or_else(lm::Config::stt_2_6b, |c| c.to_lm_config());
     let lm: LmModel<Q> = LmModel::load(&lm_vb, &lm_config)?;
     lm_vb.check_all_used()?;
 
