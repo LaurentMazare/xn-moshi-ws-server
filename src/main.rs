@@ -1,6 +1,8 @@
+mod decoder;
 mod handler;
 mod model;
 mod protocol;
+mod wav;
 
 use anyhow::Result;
 use axum::Router;
