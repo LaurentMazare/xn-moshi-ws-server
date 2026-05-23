@@ -60,6 +60,7 @@ async fn serve_q<Q: BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Resu
     };
     let sample_rate = app.sample_rate();
     let frame_size = app.frame_size;
+    let delay_in_frames = app.delay_in_frames;
     let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<AsrReply>();
     let (in_tx, in_rx) = std::sync::mpsc::channel::<InMsg>();
     let mut decoder = match serde_json::from_str::<AsrRequest>(&first_message)? {
@@ -104,6 +105,7 @@ async fn serve_q<Q: BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Resu
     };
 
     let recv_loop = async move {
+        let mut pcm_buf = Vec::with_capacity(frame_size as usize * 2);
         while let Some(msg) = rx.next().await {
             let msg = match msg? {
                 Message::Text(msg) => serde_json::from_str::<AsrRequest>(&msg)?,
@@ -123,12 +125,20 @@ async fn serve_q<Q: BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Resu
                     use base64::Engine;
                     let audio = base64::engine::general_purpose::STANDARD.decode(audio)?;
                     let pcm = decoder.decode(&audio)?;
-                    in_tx.send(InMsg::Audio(pcm))?;
+                    pcm_buf.extend_from_slice(&pcm);
+                    while pcm_buf.len() >= frame_size as usize {
+                        let pcm = pcm_buf.drain(..frame_size as usize).collect();
+                        in_tx.send(InMsg::Audio(pcm))?;
+                    }
                 }
                 AsrRequest::Flush { .. } => {}
                 AsrRequest::EndOfStream => {
                     // Do not shutdown things yet in case there is audio to be processed in the
                     // queue.
+                    for _ in 0..delay_in_frames {
+                        let pcm = vec![0f32; frame_size as usize];
+                        in_tx.send(InMsg::Audio(pcm))?;
+                    }
                     in_tx.send(InMsg::EndOfStream)?;
                 }
             }
@@ -198,11 +208,7 @@ async fn run_session<Q: BackendQ>(
                         }
                     }
                 }
-                InMsg::EndOfStream => {
-                    // TODO(laurent): drain any remaining audio in the model and send end of stream
-                    // reply.
-                    break;
-                }
+                InMsg::EndOfStream => break,
             }
         }
         Ok::<(), anyhow::Error>(())
