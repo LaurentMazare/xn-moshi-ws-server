@@ -118,13 +118,13 @@ where
                 SessionState::Awaiting,
                 AsrRequest::Setup { model_name, input_format, close_ws_on_eos: _, .. },
             ) => {
+                let sample_rate = app.sample_rate();
                 if !is_supported_input_format(&input_format) {
                     send_error(
                         reply_tx,
                         error_codes::NOT_IMPLEMENTED,
                         format!(
-                            "unsupported input_format '{input_format}', expected raw s16le PCM at {} Hz",
-                            app.sample_rate
+                            "unsupported input_format '{input_format}', expected raw s16le PCM at {sample_rate} Hz",
                         ),
                     )?;
                     continue;
@@ -135,7 +135,7 @@ where
                 tracing::info!(?model_name, ?input_format, "starting new ASR session");
                 let ready = AsrReply::Ready {
                     model_name,
-                    sample_rate: app.sample_rate,
+                    sample_rate,
                     frame_size: app.frame_size,
                     delay_in_frames: app.delay_in_frames,
                     text_stream_names: vec![],
@@ -146,12 +146,12 @@ where
                 }
 
                 let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel::<ModelCtrl>();
-                let asr = Arc::clone(&app.asr);
+                let model = app.model();
                 let tokenizer = Arc::clone(&app.tokenizer);
                 let reply_tx_clone = reply_tx.clone();
                 let handle = std::thread::Builder::new()
                     .name("asr-worker".to_string())
-                    .spawn(move || run_asr_loop(asr, tokenizer, ctrl_rx, reply_tx_clone))?;
+                    .spawn(move || run_asr_loop(model, tokenizer, ctrl_rx, reply_tx_clone))?;
                 model_thread = Some(handle);
                 sess =
                     SessionState::Ready { ctrl_tx, pcm_buf: Vec::with_capacity(bytes_per_frame) };

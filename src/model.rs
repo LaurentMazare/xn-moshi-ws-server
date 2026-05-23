@@ -16,14 +16,24 @@ pub const FRAME_SIZE: u32 = 1_920;
 pub const ASR_DELAY_S: f64 = 2.5;
 
 pub struct AppStateB<Q: BackendQ> {
-    pub asr: Arc<Asr<Q>>,
+    model: Arc<Asr<Q>>,
     pub tokenizer: Arc<sentencepiece::SentencePieceProcessor>,
     pub model_name: String,
-    pub sample_rate: u32,
+    sample_rate: u32,
     pub frame_size: u32,
     pub delay_in_frames: u32,
     /// Held for the lifetime of the active session to enforce one session at a time.
     pub session_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<Q: BackendQ> AppStateB<Q> {
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn model(&self) -> Arc<Asr<Q>> {
+        self.model.clone()
+    }
 }
 
 #[derive(Clone)]
@@ -72,10 +82,10 @@ pub fn load_asr<Q: BackendQ>(temperature: f64, dev: Q::B) -> Result<AppStateB<Q>
     lm_vb.check_all_used()?;
 
     let asr_delay_in_tokens = (ASR_DELAY_S * SAMPLE_RATE as f64 / FRAME_SIZE as f64) as usize;
-    let asr = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
+    let model = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
 
     Ok(AppStateB {
-        asr: Arc::new(asr),
+        model: Arc::new(model),
         tokenizer: Arc::new(sp),
         model_name: REPO_ID.to_string(),
         sample_rate: SAMPLE_RATE,
