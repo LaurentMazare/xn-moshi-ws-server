@@ -46,21 +46,22 @@ pub enum AppState {
     Cuda(Arc<AppStateB<xn::Unquantized<half::bf16, xn::CudaDevice>>>),
 }
 
-struct ModelPaths {
-    lm: std::path::PathBuf,
-    mimi: std::path::PathBuf,
+struct ModelPaths<Q: BackendQ> {
+    model: Asr<Q>,
     tokenizer: std::path::PathBuf,
-    config: Option<xn_moshi::moshi::Config>,
     model_name: String,
+    sample_rate: u32,
+    frame_size: u32,
+    asr_delay_in_tokens: usize,
 }
 
-impl ModelPaths {
+impl<Q: BackendQ> ModelPaths<Q> {
     const REPO_ID: &str = "kyutai/stt-2.6b-en-candle";
     const LM_FILE: &str = "model.safetensors";
     const MIMI_FILE: &str = "mimi-pytorch-e351c8d8@125.safetensors";
     const TOKENIZER_FILE: &str = "tokenizer_en_audio_4000.model";
 
-    fn stt_2b() -> Result<Self> {
+    fn stt_2b(temperature: f64, dev: &Q::B) -> Result<Self> {
         use hf_hub::{Repo, RepoType, api::sync::Api};
         tracing::info!(repo_id = %Self::REPO_ID, "downloading model");
         let api = Api::new()?;
@@ -69,7 +70,33 @@ impl ModelPaths {
         let mimi = repo.get(Self::MIMI_FILE).map_err(anyhow::Error::from)?;
         let tokenizer = repo.get(Self::TOKENIZER_FILE).map_err(anyhow::Error::from)?;
         tracing::info!(?lm, ?mimi, ?tokenizer, "model weights ready");
-        Ok(Self { lm, mimi, tokenizer, config: None, model_name: Self::REPO_ID.to_string() })
+        let mimi_vb = VB::load(&[mimi], dev.clone())?.root();
+        let mimi_config = mimi::Config::v0_1(Some(32));
+        let sample_rate = mimi_config.sample_rate as u32;
+        let frame_size = (mimi_config.sample_rate / mimi_config.frame_rate) as u32;
+        let asr_delay_in_tokens = (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
+        let mimi: Mimi<f32, Q::B> = Mimi::load(&mimi_vb, mimi_config)?;
+        mimi_vb.check_all_used_with_ignore(|s| {
+            s.ends_with("_codebook._initialized")
+                || s.ends_with("_codebook.cluster_usage")
+                || s.ends_with("_codebook.embedding_sum")
+        })?;
+
+        let lm_vb = VB::load(&[lm], dev.clone())?.root();
+        let lm_config = lm::Config::stt_2_6b();
+        let lm: LmModel<Q> = LmModel::load(&lm_vb, &lm_config)?;
+        lm_vb.check_all_used()?;
+
+        let model = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
+
+        Ok(Self {
+            model,
+            tokenizer,
+            model_name: Self::REPO_ID.to_string(),
+            sample_rate,
+            frame_size,
+            asr_delay_in_tokens,
+        })
     }
 }
 
@@ -78,26 +105,37 @@ pub fn load_asr<Q: BackendQ>(
     temperature: f64,
     dev: Q::B,
 ) -> Result<AppStateB<Q>> {
-    let paths = match model_path {
-        None => ModelPaths::stt_2b()?,
+    let model_path = match model_path {
+        None => ModelPaths::stt_2b(temperature, &dev)?,
         Some(path) if path.ends_with(".json") => {
+            let sample_rate = 24000;
+            let frame_size = 1920;
             let path = std::path::Path::new(path);
             let parent = path.parent().context("model config path has no parent directory")?;
-            let config = std::fs::read_to_string(path)?;
-            let config: xn_moshi::moshi::Config = serde_json::from_str(&config)?;
+            let asr_delay_in_tokens =
+                (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
+            let model = xn_moshi::asr::Asr::load(
+                parent.join("mimi.safetensors").to_str().context("invalid mimi path")?,
+                parent.join("model.safetensors").to_str().context("invalid model path")?,
+                Some(path.to_str().context("invalid config path")?),
+                asr_delay_in_tokens,
+                temperature,
+                dev,
+            )?;
+            let model_name =
+                path.file_stem().and_then(|s| s.to_str()).unwrap_or("custom_model").to_string();
             ModelPaths {
-                lm: parent.join("model.safetensors"),
-                mimi: parent.join("mimi.safetensors"),
+                model,
                 tokenizer: parent.join("tokenizer.model"),
-                config: Some(config),
-                model_name: path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("custom_model")
-                    .to_string(),
+                model_name,
+                sample_rate,
+                frame_size,
+                asr_delay_in_tokens,
             }
         }
         Some(repo_id) => {
+            let sample_rate = 24000;
+            let frame_size = 1920;
             use hf_hub::{Repo, RepoType, api::sync::Api};
             let api = Api::new()?;
             let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
@@ -106,50 +144,39 @@ pub fn load_asr<Q: BackendQ>(
             let mimi = repo.get("mimi.safetensors").map_err(anyhow::Error::from)?;
             let tokenizer = repo.get("tokenizer.model").map_err(anyhow::Error::from)?;
             tracing::info!(?lm, ?mimi, ?tokenizer, "model weights ready");
-            let config = std::fs::read_to_string(config)
-                .with_context(|| format!("failed to read config from {repo_id}"))?;
-            let config = serde_json::from_str(&config)
-                .with_context(|| format!("failed to parse config from {repo_id} as JSON"))?;
+            let asr_delay_in_tokens =
+                (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
+            let model = xn_moshi::asr::Asr::load(
+                mimi.to_str().context("invalid mimi path")?,
+                lm.to_str().context("invalid model path")?,
+                Some(&config.to_str().context("invalid config path")?),
+                asr_delay_in_tokens,
+                temperature,
+                dev,
+            )?;
+            let model_name = repo_id.to_string();
             ModelPaths {
-                lm,
-                mimi,
+                model,
                 tokenizer,
-                config: Some(config),
-                model_name: repo_id.to_string(),
+                model_name,
+                sample_rate,
+                frame_size,
+                asr_delay_in_tokens,
             }
         }
     };
 
-    let tokenizer_path_str = paths.tokenizer.to_str().context("invalid tokenizer path")?;
+    let tokenizer_path_str = model_path.tokenizer.to_str().context("invalid tokenizer path")?;
     let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path_str)
         .with_context(|| format!("failed to open tokenizer at {tokenizer_path_str}"))?;
 
-    let mimi_vb = VB::load(&[paths.mimi], dev.clone())?.root();
-    let mimi_config = mimi::Config::v0_1(Some(32));
-    let sample_rate = mimi_config.sample_rate as u32;
-    let frame_size = (mimi_config.sample_rate / mimi_config.frame_rate) as u32;
-    let mimi: Mimi<f32, Q::B> = Mimi::load(&mimi_vb, mimi_config)?;
-    mimi_vb.check_all_used_with_ignore(|s| {
-        s.ends_with("_codebook._initialized")
-            || s.ends_with("_codebook.cluster_usage")
-            || s.ends_with("_codebook.embedding_sum")
-    })?;
-
-    let lm_vb = VB::load(&[paths.lm], dev)?.root();
-    let lm_config = paths.config.map_or_else(lm::Config::stt_2_6b, |c| c.to_lm_config());
-    let lm: LmModel<Q> = LmModel::load(&lm_vb, &lm_config)?;
-    lm_vb.check_all_used()?;
-
-    let asr_delay_in_tokens = (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
-    let model = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
-
     Ok(AppStateB {
-        model: Arc::new(model),
+        model: model_path.model.into(),
         tokenizer: Arc::new(sp),
-        model_name: paths.model_name,
-        sample_rate,
-        frame_size,
-        delay_in_frames: asr_delay_in_tokens as u32,
+        model_name: model_path.model_name,
+        sample_rate: model_path.sample_rate,
+        frame_size: model_path.frame_size,
+        delay_in_frames: model_path.asr_delay_in_tokens as u32,
         session_lock: Arc::new(tokio::sync::Mutex::new(())),
     })
 }
