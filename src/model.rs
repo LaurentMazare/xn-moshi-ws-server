@@ -80,7 +80,7 @@ pub fn load_asr<Q: BackendQ>(
 ) -> Result<AppStateB<Q>> {
     let paths = match model_path {
         None => ModelPaths::stt_2b()?,
-        Some(path) => {
+        Some(path) if path.ends_with(".json") => {
             let path = std::path::Path::new(path);
             let parent = path.parent().context("model config path has no parent directory")?;
             let config = std::fs::read_to_string(path)?;
@@ -95,6 +95,27 @@ pub fn load_asr<Q: BackendQ>(
                     .and_then(|s| s.to_str())
                     .unwrap_or("custom_model")
                     .to_string(),
+            }
+        }
+        Some(repo_id) => {
+            use hf_hub::{Repo, RepoType, api::sync::Api};
+            let api = Api::new()?;
+            let repo = api.repo(Repo::new(repo_id.to_string(), RepoType::Model));
+            let config = repo.get("config.json").map_err(anyhow::Error::from)?;
+            let lm = repo.get("model.safetensors").map_err(anyhow::Error::from)?;
+            let mimi = repo.get("mimi.safetensors").map_err(anyhow::Error::from)?;
+            let tokenizer = repo.get("tokenizer.model").map_err(anyhow::Error::from)?;
+            tracing::info!(?lm, ?mimi, ?tokenizer, "model weights ready");
+            let config = std::fs::read_to_string(config)
+                .with_context(|| format!("failed to read config from {repo_id}"))?;
+            let config = serde_json::from_str(&config)
+                .with_context(|| format!("failed to parse config from {repo_id} as JSON"))?;
+            ModelPaths {
+                lm,
+                mimi,
+                tokenizer,
+                config: Some(config),
+                model_name: repo_id.to_string(),
             }
         }
     };
