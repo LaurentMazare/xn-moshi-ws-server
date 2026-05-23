@@ -55,13 +55,13 @@ pub enum AppState {
 
 pub fn load_asr<Q: BackendQ>(temperature: f64, dev: Q::B) -> Result<AppStateB<Q>> {
     use hf_hub::{Repo, RepoType, api::sync::Api};
-    tracing::info!(repo_id = %REPO_ID, "downloading ASR model artifacts");
+    tracing::info!(repo_id = %REPO_ID, "downloading model");
     let api = Api::new()?;
     let repo = api.repo(Repo::new(REPO_ID.to_string(), RepoType::Model));
     let lm_path = repo.get(LM_FILE).map_err(anyhow::Error::from)?;
     let mimi_path = repo.get(MIMI_FILE).map_err(anyhow::Error::from)?;
     let tokenizer_path = repo.get(TOKENIZER_FILE).map_err(anyhow::Error::from)?;
-    tracing::info!(?lm_path, ?mimi_path, ?tokenizer_path, "ASR artifacts ready");
+    tracing::info!(?lm_path, ?mimi_path, ?tokenizer_path, "model weights ready");
 
     let tokenizer_path_str = tokenizer_path.to_str().context("invalid tokenizer path")?;
     let sp = sentencepiece::SentencePieceProcessor::open(tokenizer_path_str)

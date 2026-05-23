@@ -41,10 +41,10 @@ enum InMsg {
 
 async fn serve_q<Q: BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
-    let (mut tx, mut rx) = socket.split();
+    let (mut socket_tx, mut socket_rx) = socket.split();
 
     let first_message = loop {
-        match rx.next().await {
+        match socket_rx.next().await {
             Some(msg) => match msg? {
                 Message::Text(t) => break t,
                 Message::Close(_) => {
@@ -96,17 +96,21 @@ async fn serve_q<Q: BackendQ>(socket: WebSocket, app: Arc<AppStateB<Q>>) -> Resu
     let send_loop = async move {
         while let Some(reply) = reply_rx.recv().await {
             let json = serde_json::to_string(&reply)?;
-            if tx.send(Message::Text(json.into())).await.is_err() {
+            if socket_tx.send(Message::Text(json.into())).await.is_err() {
+                break;
+            }
+            if let AsrReply::EndOfStream = reply {
+                tracing::info!("end of stream reply sent, closing websocket");
                 break;
             }
         }
-        let _ = tx.close().await;
+        let _ = socket_tx.close().await;
         Ok::<_, anyhow::Error>(())
     };
 
     let recv_loop = async move {
         let mut pcm_buf = Vec::with_capacity(frame_size as usize * 2);
-        while let Some(msg) = rx.next().await {
+        while let Some(msg) = socket_rx.next().await {
             let msg = match msg? {
                 Message::Text(msg) => serde_json::from_str::<AsrRequest>(&msg)?,
                 Message::Close(_) => {
@@ -176,7 +180,7 @@ async fn run_session<Q: BackendQ>(
     in_rx: std::sync::mpsc::Receiver<InMsg>,
     reply_tx: tokio::sync::mpsc::UnboundedSender<AsrReply>,
 ) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<()> {
         use xn_moshi::asr::AsrWord;
 
         let mut state = app.model().init_state(1)?;
@@ -208,10 +212,12 @@ async fn run_session<Q: BackendQ>(
                         }
                     }
                 }
-                InMsg::EndOfStream => break,
+                InMsg::EndOfStream => {
+                    // Do not break here, we want to ensure that the websocket gets closed first.
+                    reply_tx.send(AsrReply::EndOfStream)?;
+                }
             }
         }
-        Ok::<(), anyhow::Error>(())
     })
     .await??;
     Ok(())
