@@ -149,7 +149,7 @@ pub fn load_asr<Q: BackendQ>(
             let model = xn_moshi::asr::Asr::load(
                 mimi.to_str().context("invalid mimi path")?,
                 lm.to_str().context("invalid model path")?,
-                Some(&config.to_str().context("invalid config path")?),
+                Some(config.to_str().context("invalid config path")?),
                 asr_delay_in_tokens,
                 temperature,
                 dev,
