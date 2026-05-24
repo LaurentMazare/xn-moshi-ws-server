@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Moshi STT demo</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 720px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      button {
+        font-size: 1.1rem;
+        padding: 0.6rem 1.2rem;
+        cursor: pointer;
+      }
+      #status {
+        margin-left: 1rem;
+        color: #555;
+      }
+      #transcript {
+        margin-top: 1.5rem;
+        padding: 1rem;
+        min-height: 8rem;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        background: #fafafa;
+        white-space: pre-wrap;
+        line-height: 1.5;
+      }
+      #wave {
+        display: block;
+        width: 100%;
+        height: 140px;
+        margin-top: 1.5rem;
+        background: #0e1320;
+        border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Moshi STT demo</h1>
+    <button id="toggle">Start</button>
+    <span id="status">idle</span>
+    <canvas id="wave"></canvas>
+    <div id="transcript"></div>
+
+    <script>
+      const SERVER_URL = "ws://localhost:8080/speech/asr";
+      const TARGET_SR = 24000;
+
+      const toggleBtn = document.getElementById("toggle");
+      const statusEl = document.getElementById("status");
+      const transcriptEl = document.getElementById("transcript");
+      const waveCanvas = document.getElementById("wave");
+      const waveCtx = waveCanvas.getContext("2d");
+
+      let running = false;
+      let ws = null;
+      let audioCtx = null;
+      let micStream = null;
+      let sourceNode = null;
+      let processorNode = null;
+      let analyser = null;
+      let analyserBuf = null;
+      let waveRAF = null;
+
+      function setStatus(s) {
+        statusEl.textContent = s;
+      }
+
+      function appendText(t) {
+        const word = t.replace(/^\s+/, "");
+        if (!word) return;
+        const current = transcriptEl.textContent;
+        const needsSpace = current.length > 0 && !/\s$/.test(current);
+        transcriptEl.textContent = current + (needsSpace ? " " : "") + word;
+      }
+
+      // Encode a Uint8Array to base64 without exceeding call-stack limits.
+      function toBase64(bytes) {
+        let s = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          s += String.fromCharCode.apply(
+            null,
+            bytes.subarray(i, i + chunk),
+          );
+        }
+        return btoa(s);
+      }
+
+      function floatToPcm16(float32) {
+        const out = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          let s = Math.max(-1, Math.min(1, float32[i]));
+          out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+        }
+        return out;
+      }
+
+      async function start() {
+        transcriptEl.textContent = "";
+        setStatus("connecting...");
+
+        ws = new WebSocket(SERVER_URL);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          setStatus("connected, setting up...");
+          ws.send(
+            JSON.stringify({
+              type: "setup",
+              json_config: "",
+              model_name: "",
+              input_format: "pcm_24000",
+              close_ws_on_eos: false,
+            }),
+          );
+        };
+
+        ws.onmessage = (ev) => {
+          let msg;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch (e) {
+            console.warn("non-json message", ev.data);
+            return;
+          }
+          switch (msg.type) {
+            case "ready":
+              setStatus(`ready (${msg.model_name})`);
+              startCapture().catch((err) => {
+                console.error(err);
+                setStatus("mic error: " + err.message);
+                stop();
+              });
+              break;
+            case "text":
+              appendText(msg.text);
+              break;
+            case "end_text":
+              // Optional: mark end-of-word. Plain space is enough for display.
+              break;
+            case "step":
+              break;
+            case "end_of_stream":
+              setStatus("end of stream");
+              break;
+            case "error":
+              console.error("server error", msg);
+              setStatus(`error ${msg.code}: ${msg.message}`);
+              break;
+            default:
+              console.log("msg", msg);
+          }
+        };
+
+        ws.onerror = (e) => {
+          console.error("ws error", e);
+          setStatus("websocket error");
+        };
+
+        ws.onclose = () => {
+          setStatus("disconnected");
+          cleanupAudio();
+          running = false;
+          toggleBtn.textContent = "Start";
+        };
+      }
+
+      async function startCapture() {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+          },
+        });
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: TARGET_SR,
+        });
+
+        // Some browsers ignore the requested sampleRate; we'll resample if needed.
+        const ctxSr = audioCtx.sampleRate;
+        sourceNode = audioCtx.createMediaStreamSource(micStream);
+
+        // ScriptProcessorNode is deprecated but works without a separate worklet
+        // file, which keeps this demo self-contained.
+        const bufSize = 4096;
+        processorNode = audioCtx.createScriptProcessor(bufSize, 1, 1);
+
+        let resampleResidual = null;
+        const ratio = ctxSr / TARGET_SR;
+
+        processorNode.onaudioprocess = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0);
+          let pcm;
+          if (Math.abs(ratio - 1) < 1e-6) {
+            pcm = input;
+          } else {
+            // Naive linear resampling to 24kHz. Adequate for a demo.
+            const outLen = Math.floor(input.length / ratio);
+            const out = new Float32Array(outLen);
+            for (let i = 0; i < outLen; i++) {
+              const srcIdx = i * ratio;
+              const i0 = Math.floor(srcIdx);
+              const i1 = Math.min(i0 + 1, input.length - 1);
+              const frac = srcIdx - i0;
+              out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+            }
+            pcm = out;
+          }
+          const pcm16 = floatToPcm16(pcm);
+          const bytes = new Uint8Array(
+            pcm16.buffer,
+            pcm16.byteOffset,
+            pcm16.byteLength,
+          );
+          ws.send(
+            JSON.stringify({ type: "audio", audio: toBase64(bytes) }),
+          );
+        };
+
+        sourceNode.connect(processorNode);
+        // Required for onaudioprocess to fire in some browsers.
+        processorNode.connect(audioCtx.destination);
+
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.85;
+        analyserBuf = new Uint8Array(analyser.fftSize);
+        sourceNode.connect(analyser);
+        startWaveAnim();
+
+        setStatus(`listening (ctx ${ctxSr}Hz → ${TARGET_SR}Hz)`);
+      }
+
+      function resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = waveCanvas.clientWidth;
+        const h = waveCanvas.clientHeight;
+        if (
+          waveCanvas.width !== Math.floor(w * dpr) ||
+          waveCanvas.height !== Math.floor(h * dpr)
+        ) {
+          waveCanvas.width = Math.floor(w * dpr);
+          waveCanvas.height = Math.floor(h * dpr);
+          waveCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        }
+      }
+
+      function startWaveAnim() {
+        const draw = () => {
+          waveRAF = requestAnimationFrame(draw);
+          if (!analyser) return;
+          resizeCanvas();
+          const w = waveCanvas.clientWidth;
+          const h = waveCanvas.clientHeight;
+
+          // Background fade for trail effect.
+          waveCtx.fillStyle = "rgba(14, 19, 32, 0.35)";
+          waveCtx.fillRect(0, 0, w, h);
+
+          analyser.getByteTimeDomainData(analyserBuf);
+
+          // Midline.
+          waveCtx.strokeStyle = "rgba(255,255,255,0.08)";
+          waveCtx.lineWidth = 1;
+          waveCtx.beginPath();
+          waveCtx.moveTo(0, h / 2);
+          waveCtx.lineTo(w, h / 2);
+          waveCtx.stroke();
+
+          // Compute RMS for a subtle glow tied to loudness.
+          let sumSq = 0;
+          for (let i = 0; i < analyserBuf.length; i++) {
+            const v = (analyserBuf[i] - 128) / 128;
+            sumSq += v * v;
+          }
+          const rms = Math.sqrt(sumSq / analyserBuf.length);
+          const glow = Math.min(1, rms * 4);
+
+          // Waveform stroke.
+          const grad = waveCtx.createLinearGradient(0, 0, w, 0);
+          grad.addColorStop(0, "#5ee2ff");
+          grad.addColorStop(0.5, "#7c9bff");
+          grad.addColorStop(1, "#c46bff");
+          waveCtx.strokeStyle = grad;
+          waveCtx.lineWidth = 2;
+          waveCtx.shadowBlur = 12 * glow;
+          waveCtx.shadowColor = "#7c9bff";
+
+          waveCtx.beginPath();
+          const step = analyserBuf.length / w;
+          for (let x = 0; x < w; x++) {
+            const sample = analyserBuf[Math.floor(x * step)] / 128 - 1;
+            const y = h / 2 + sample * (h / 2 - 4);
+            if (x === 0) waveCtx.moveTo(x, y);
+            else waveCtx.lineTo(x, y);
+          }
+          waveCtx.stroke();
+          waveCtx.shadowBlur = 0;
+        };
+        draw();
+      }
+
+      function stopWaveAnim() {
+        if (waveRAF) {
+          cancelAnimationFrame(waveRAF);
+          waveRAF = null;
+        }
+        analyser = null;
+        analyserBuf = null;
+        const w = waveCanvas.clientWidth;
+        const h = waveCanvas.clientHeight;
+        resizeCanvas();
+        waveCtx.fillStyle = "#0e1320";
+        waveCtx.fillRect(0, 0, w, h);
+      }
+
+      function cleanupAudio() {
+        stopWaveAnim();
+        if (processorNode) {
+          try {
+            processorNode.disconnect();
+          } catch {}
+          processorNode.onaudioprocess = null;
+          processorNode = null;
+        }
+        if (sourceNode) {
+          try {
+            sourceNode.disconnect();
+          } catch {}
+          sourceNode = null;
+        }
+        if (audioCtx) {
+          audioCtx.close().catch(() => {});
+          audioCtx = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach((t) => t.stop());
+          micStream = null;
+        }
+      }
+
+      function stop() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: "end_of_stream" }));
+          } catch {}
+          try {
+            ws.close();
+          } catch {}
+        }
+        cleanupAudio();
+      }
+
+      toggleBtn.addEventListener("click", async () => {
+        if (running) {
+          running = false;
+          toggleBtn.textContent = "Start";
+          setStatus("stopping...");
+          stop();
+        } else {
+          running = true;
+          toggleBtn.textContent = "Stop";
+          try {
+            await start();
+          } catch (err) {
+            console.error(err);
+            setStatus("error: " + err.message);
+            running = false;
+            toggleBtn.textContent = "Start";
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
