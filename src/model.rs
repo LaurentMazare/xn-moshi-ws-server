@@ -15,6 +15,7 @@ pub struct AppStateB<Q: BackendQ> {
     sample_rate: u32,
     pub frame_size: u32,
     pub delay_in_frames: u32,
+    pub vad_horizons: Vec<f32>,
     /// Held for the lifetime of the active session to enforce one session at a time.
     pub session_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -53,6 +54,7 @@ struct ModelPaths<Q: BackendQ> {
     sample_rate: u32,
     frame_size: u32,
     asr_delay_in_tokens: usize,
+    vad_horizons: Vec<f32>,
 }
 
 impl<Q: BackendQ> ModelPaths<Q> {
@@ -96,8 +98,15 @@ impl<Q: BackendQ> ModelPaths<Q> {
             sample_rate,
             frame_size,
             asr_delay_in_tokens,
+            vad_horizons: vec![],
         })
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct AsrConfig {
+    asr_delay_in_tokens: Option<usize>,
+    vad_horizons: Option<Vec<f32>>,
 }
 
 pub fn load_asr<Q: BackendQ>(
@@ -112,8 +121,12 @@ pub fn load_asr<Q: BackendQ>(
             let frame_size = 1920;
             let path = std::path::Path::new(path);
             let parent = path.parent().context("model config path has no parent directory")?;
-            let asr_delay_in_tokens =
-                (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
+            let asr_config = serde_json::from_str::<AsrConfig>(&std::fs::read_to_string(path)?)
+                .context("failed to parse config.json")?;
+            tracing::info!(?asr_config, "ASR config loaded");
+            let asr_delay_in_tokens = asr_config
+                .asr_delay_in_tokens
+                .unwrap_or((ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize);
             let model = xn_moshi::asr::Asr::load(
                 parent.join("mimi.safetensors").to_str().context("invalid mimi path")?,
                 parent.join("model.safetensors").to_str().context("invalid model path")?,
@@ -131,6 +144,7 @@ pub fn load_asr<Q: BackendQ>(
                 sample_rate,
                 frame_size,
                 asr_delay_in_tokens,
+                vad_horizons: asr_config.vad_horizons.unwrap_or_default(),
             }
         }
         Some(repo_id) => {
@@ -144,8 +158,12 @@ pub fn load_asr<Q: BackendQ>(
             let mimi = repo.get("mimi.safetensors").map_err(anyhow::Error::from)?;
             let tokenizer = repo.get("tokenizer.model").map_err(anyhow::Error::from)?;
             tracing::info!(?lm, ?mimi, ?tokenizer, "model weights ready");
-            let asr_delay_in_tokens =
-                (ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize;
+            let asr_config = serde_json::from_str::<AsrConfig>(&std::fs::read_to_string(&config)?)
+                .context("failed to parse config.json")?;
+            tracing::info!(?asr_config, "ASR config loaded");
+            let asr_delay_in_tokens = asr_config
+                .asr_delay_in_tokens
+                .unwrap_or((ASR_DELAY_S * sample_rate as f64 / frame_size as f64) as usize);
             let model = xn_moshi::asr::Asr::load(
                 mimi.to_str().context("invalid mimi path")?,
                 lm.to_str().context("invalid model path")?,
@@ -162,6 +180,7 @@ pub fn load_asr<Q: BackendQ>(
                 sample_rate,
                 frame_size,
                 asr_delay_in_tokens,
+                vad_horizons: asr_config.vad_horizons.unwrap_or_default(),
             }
         }
     };
@@ -178,5 +197,6 @@ pub fn load_asr<Q: BackendQ>(
         frame_size: model_path.frame_size,
         delay_in_frames: model_path.asr_delay_in_tokens as u32,
         session_lock: Arc::new(tokio::sync::Mutex::new(())),
+        vad_horizons: model_path.vad_horizons,
     })
 }

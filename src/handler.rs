@@ -200,8 +200,9 @@ async fn run_session<Q: BackendQ>(
                         if !extra_heads.is_empty() {
                             let vad = extra_heads
                                 .iter()
-                                .map(|e| crate::protocol::VadPrediction {
-                                    horizon_s: 0.0,
+                                .zip(app.vad_horizons.iter())
+                                .map(|(e, horizon_s)| crate::protocol::VadPrediction {
+                                    horizon_s: *horizon_s,
                                     inactivity_prob: e[0],
                                 })
                                 .collect::<Vec<_>>();
