@@ -187,6 +187,8 @@ async fn run_session<Q: BackendQ>(
         let dev = app.model().device().clone();
         let tokenizer = &app.tokenizer;
         let mask = StreamMask::all_active(1);
+        let mut step_idx = 0;
+        let step_duration_s = app.frame_size as f64 / app.sample_rate() as f64;
         loop {
             let input = in_rx.recv()?;
             match input {
@@ -194,6 +196,25 @@ async fn run_session<Q: BackendQ>(
                     let pcm = Tensor::from_vec(pcm, (1, 1, ()), &dev)?;
                     let pcm = StreamTensor::from_tensor(pcm);
                     for sr in state.step_pcm(&pcm, &mask, |_, _, _| {})? {
+                        let extra_heads = &sr.prs;
+                        if !extra_heads.is_empty() {
+                            let vad = extra_heads
+                                .iter()
+                                .map(|e| crate::protocol::VadPrediction {
+                                    horizon_s: 0.0,
+                                    inactivity_prob: e[0],
+                                })
+                                .collect::<Vec<_>>();
+                            let total_duration_s = step_duration_s * (step_idx + 1) as f64;
+                            let step = AsrReply::Step {
+                                step_idx,
+                                vad,
+                                step_duration_s: step_duration_s as f32,
+                                total_duration_s: total_duration_s as f32,
+                            };
+                            let _ = reply_tx.send(step).is_err();
+                        }
+                        step_idx += 1;
                         for word in sr.words {
                             let msg = match word {
                                 AsrWord::Word { tokens, batch_idx: _, start_time } => {
